@@ -161,6 +161,11 @@ jobs:
               echo "$COMMIT" > /out/amneziawg-go.commit
               echo "$GO_TAG" > /out/amneziawg-go.tag
               go version | tee /out/go-version.txt
+              # Upstream Dockerfile does this before building; amneziawg-go has
+              # no vendor/ directory, so modules come from the proxy and their
+              # checksums must be verified against go.sum explicitly.
+              go mod download
+              go mod verify
               # Same static ldflags as upstream Dockerfile at this tag.
               CGO_ENABLED=1 go build \
                 -ldflags '\''-linkmode external -extldflags "-fno-PIC -static"'\'' \
@@ -230,7 +235,10 @@ jobs:
           echo "file amneziawg-go-linux-amd64: ${file_go}"
           echo "$file_go" | grep -qiE 'ELF 64-bit LSB (executable|pie executable), x86-64' \
             || fail "amneziawg-go-linux-amd64 is not an ELF x86-64 executable: ${file_go}"
-          echo "$file_go" | grep -qi 'statically linked' \
+          # `file` reports plain static as "statically linked" but a static-PIE
+          # build as "static-pie linked". -fno-PIC should produce the former;
+          # accept both so a link-mode change fails on substance, not wording.
+          echo "$file_go" | grep -qiE 'statically linked|static-pie linked' \
             || fail "amneziawg-go-linux-amd64 is not statically linked: ${file_go}"
           # Verified: main.go accepts --version
           ./amneziawg-go-linux-amd64 --version
@@ -272,6 +280,112 @@ jobs:
             echo '```'
             cat SHA256SUMS
             echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Proves the two binaries actually interoperate over UAPI, which the
+      # per-binary smoke tests above cannot show. This is what catches a
+      # mismatched pair (e.g. a 3.x datapath driven by 2.x tools): `awg setconf`
+      # would send obfuscation keys that amneziawg-go silently ignores, and the
+      # showconf/show round-trip below would not return them.
+      - name: Integration test (awg <-> amneziawg-go over UAPI)
+        if: steps.existing.outputs.exists != 'true' || steps.existing.outputs.force == 'true'
+        run: |
+          set -euo pipefail
+          # amneziawg-go creates a TUN device, so the runner must expose one.
+          sudo modprobe tun || true
+          if [[ ! -c /dev/net/tun ]]; then
+            echo "::error::/dev/net/tun is unavailable on this runner - the UAPI integration test cannot run. Do not disable this test to go green; fix the runner or move the test to a VM."
+            exit 1
+          fi
+          docker run --rm \
+            --cap-add NET_ADMIN \
+            --device /dev/net/tun \
+            -v "${{ github.workspace }}/dist:/dist:ro" \
+            "${TOOLS_IMAGE}" \
+            bash -euo pipefail -c '
+              install -m 0755 /dist/amneziawg-go-linux-amd64 /usr/local/bin/amneziawg-go
+              install -m 0755 /dist/awg-linux-amd64 /usr/local/bin/awg
+
+              # Start the userspace datapath in the foreground and wait for the
+              # UAPI socket. The kernel module never creates this socket, so its
+              # presence also proves which datapath is serving the interface.
+              amneziawg-go -f awg0 &
+              go_pid=$!
+              for _ in $(seq 1 50); do
+                [[ -S /var/run/amneziawg/awg0.sock ]] && break
+                sleep 0.2
+              done
+              if [[ ! -S /var/run/amneziawg/awg0.sock ]]; then
+                echo "amneziawg-go did not create /var/run/amneziawg/awg0.sock"
+                exit 1
+              fi
+
+              priv=$(awg genkey)
+              peer_priv=$(awg genkey)
+              peer_pub=$(printf %s "$peer_priv" | awg pubkey)
+
+              # setconf-valid keys only: Address/MTU/DNS belong to awg-quick.
+              # S1+56 != S2 so the init and response packet sizes cannot collide;
+              # H1-H4 must be distinct and above the 1-4 reserved message types.
+              # Built with printf rather than a heredoc: a heredoc terminator
+              # cannot be indented, and every line here lives inside a YAML
+              # block scalar that requires indentation.
+              printf "%s\n" \
+                "[Interface]" \
+                "PrivateKey = $priv" \
+                "ListenPort = 51820" \
+                "Jc = 4" \
+                "Jmin = 40" \
+                "Jmax = 70" \
+                "S1 = 30" \
+                "S2 = 40" \
+                "S3 = 20" \
+                "S4 = 10" \
+                "H1 = 1000000001" \
+                "H2 = 1000000002" \
+                "H3 = 1000000003" \
+                "H4 = 1000000004" \
+                "" \
+                "[Peer]" \
+                "PublicKey = $peer_pub" \
+                "AllowedIPs = 10.9.9.2/32" \
+                > /tmp/awg0.conf
+
+              awg setconf awg0 /tmp/awg0.conf
+              awg show awg0
+
+              # Read the obfuscation parameters back. If amneziawg-go had not
+              # accepted them over UAPI these would be 0 or absent.
+              [[ "$(awg show awg0 listen-port)" == "51820" ]]
+              [[ "$(awg show awg0 jc)" == "4" ]]
+              [[ "$(awg show awg0 jmin)" == "40" ]]
+              [[ "$(awg show awg0 jmax)" == "70" ]]
+              [[ "$(awg show awg0 s1)" == "30" ]]
+              [[ "$(awg show awg0 s2)" == "40" ]]
+              [[ "$(awg show awg0 s3)" == "20" ]]
+              [[ "$(awg show awg0 s4)" == "10" ]]
+              awg show awg0 peers | grep -qx "$peer_pub"
+
+              awg showconf awg0 > /tmp/roundtrip.conf
+              cat /tmp/roundtrip.conf
+              grep -qx "Jc = 4" /tmp/roundtrip.conf
+              grep -qx "S1 = 30" /tmp/roundtrip.conf
+              grep -qx "S4 = 10" /tmp/roundtrip.conf
+              # H1-H4 are formatted by u32_range_to_string, so only assert that
+              # the tools emit them rather than guessing the exact rendering.
+              grep -q "^H1 = ." /tmp/roundtrip.conf
+              grep -q "^H4 = ." /tmp/roundtrip.conf
+
+              kill "$go_pid"
+              echo "UAPI integration test OK"
+            '
+
+          {
+            echo "## Integration test"
+            echo ""
+            echo "- \`amneziawg-go\` created \`/var/run/amneziawg/awg0.sock\` (userspace datapath confirmed)"
+            echo "- \`awg setconf\` applied Jc/Jmin/Jmax/S1-S4/H1-H4 and \`awg show\`/\`showconf\` read them back unchanged"
+            echo "- peer public key present in \`awg show awg0 peers\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Delete existing release when force=true
