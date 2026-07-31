@@ -1,0 +1,468 @@
+name: Build and publish AmneziaWG userspace binaries
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - version.txt
+      - .github/workflows/build.yml
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Overwrite an existing release with the same tag
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: "1.25.12"
+  GO_IMAGE: "golang:1.25.12"
+  TOOLS_IMAGE: "ubuntu:22.04"
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Parse version.txt
+        id: versions
+        run: |
+          set -euo pipefail
+          FILE="version.txt"
+          if [[ ! -f "$FILE" ]]; then
+            echo "::error::version.txt is missing"
+            exit 1
+          fi
+
+          go_tag=""
+          tools_tag=""
+          line_no=0
+          while IFS= read -r raw || [[ -n "$raw" ]]; do
+            line_no=$((line_no + 1))
+            # strip CR, skip blank lines and comments
+            line="${raw//$'\r'/}"
+            [[ -z "${line//[[:space:]]/}" ]] && continue
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+            if [[ ! "$line" =~ ^(amneziawg-go|amneziawg-tools)=.+$ ]]; then
+              echo "::error::version.txt line ${line_no}: malformed entry: ${line}"
+              echo "Expected KEY=VALUE with KEY in {amneziawg-go,amneziawg-tools} and a non-empty VALUE (git tag)."
+              exit 1
+            fi
+
+            key="${line%%=*}"
+            value="${line#*=}"
+            if [[ -z "$value" || "$value" =~ [[:space:]] ]]; then
+              echo "::error::version.txt line ${line_no}: empty or whitespace-containing value for ${key}"
+              exit 1
+            fi
+
+            case "$key" in
+              amneziawg-go)
+                if [[ -n "$go_tag" ]]; then
+                  echo "::error::version.txt: duplicate amneziawg-go entry"
+                  exit 1
+                fi
+                go_tag="$value"
+                ;;
+              amneziawg-tools)
+                if [[ -n "$tools_tag" ]]; then
+                  echo "::error::version.txt: duplicate amneziawg-tools entry"
+                  exit 1
+                fi
+                tools_tag="$value"
+                ;;
+            esac
+          done < "$FILE"
+
+          if [[ -z "$go_tag" || -z "$tools_tag" ]]; then
+            echo "::error::version.txt must define both amneziawg-go and amneziawg-tools"
+            echo "parsed amneziawg-go='${go_tag:-<missing>}' amneziawg-tools='${tools_tag:-<missing>}'"
+            exit 1
+          fi
+
+          release_tag="awg-${go_tag}-tools-${tools_tag}"
+
+          {
+            echo "go_tag=${go_tag}"
+            echo "tools_tag=${tools_tag}"
+            echo "release_tag=${release_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Parsed versions"
+            echo ""
+            echo "| Component | Upstream tag |"
+            echo "|---|---|"
+            echo "| amneziawg-go | \`${go_tag}\` |"
+            echo "| amneziawg-tools | \`${tools_tag}\` |"
+            echo ""
+            echo "Release tag: \`${release_tag}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check whether release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.versions.outputs.release_tag }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release \`${RELEASE_TAG}\` already exists." >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$FORCE" == "true" ]]; then
+              echo "force=true" >> "$GITHUB_OUTPUT"
+              echo "\`force=true\`: will delete and recreate the release." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "force=false" >> "$GITHUB_OUTPUT"
+              echo "Skipping publish (idempotent). Re-run with workflow_dispatch input \`force=true\` to overwrite." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "force=false" >> "$GITHUB_OUTPUT"
+            echo "No existing release for \`${RELEASE_TAG}\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Skip when release exists and force is false
+        if: steps.existing.outputs.exists == 'true' && steps.existing.outputs.force != 'true'
+        run: |
+          echo "Release ${{ steps.versions.outputs.release_tag }} already exists; nothing to do."
+          echo "To rebuild and overwrite, re-run this workflow via workflow_dispatch with force=true."
+
+      - name: Prepare artifact directory
+        if: steps.existing.outputs.exists != 'true' || steps.existing.outputs.force == 'true'
+        run: mkdir -p dist stage
+
+      - name: Build amneziawg-go (static, linux/amd64)
+        if: steps.existing.outputs.exists != 'true' || steps.existing.outputs.force == 'true'
+        env:
+          GO_TAG: ${{ steps.versions.outputs.go_tag }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${{ github.workspace }}/dist:/out" \
+            -e GO_TAG \
+            -e GO_VERSION \
+            "${GO_IMAGE}" \
+            bash -euo pipefail -c '
+              apt-get update -qq
+              apt-get install -y -qq git ca-certificates >/dev/null
+              git clone --depth 1 --branch "$GO_TAG" https://github.com/amnezia-vpn/amneziawg-go.git /src
+              cd /src
+              # Record identity before build (version.go in tree may be stale).
+              COMMIT="$(git rev-parse HEAD)"
+              echo "$COMMIT" > /out/amneziawg-go.commit
+              echo "$GO_TAG" > /out/amneziawg-go.tag
+              go version | tee /out/go-version.txt
+              # Upstream Dockerfile does this before building; amneziawg-go has
+              # no vendor/ directory, so modules come from the proxy and their
+              # checksums must be verified against go.sum explicitly.
+              go mod download
+              go mod verify
+              # Same static ldflags as upstream Dockerfile at this tag.
+              CGO_ENABLED=1 go build \
+                -ldflags '\''-linkmode external -extldflags "-fno-PIC -static"'\'' \
+                -v \
+                -o /out/amneziawg-go-linux-amd64 \
+                .
+              chmod 0755 /out/amneziawg-go-linux-amd64
+            '
+
+      - name: Build awg + awg-quick (ubuntu:22.04 / glibc 2.35)
+        if: steps.existing.outputs.exists != 'true' || steps.existing.outputs.force == 'true'
+        env:
+          TOOLS_TAG: ${{ steps.versions.outputs.tools_tag }}
+        run: |
+          set -euo pipefail
+          # Staged install via upstream src/Makefile so install-time transforms are preserved.
+          # Verified flags against amnezia-vpn/amneziawg-tools src/Makefile:
+          #   PREFIX, DESTDIR, WITH_WGQUICK, WITH_SYSTEMDUNITS, WITH_BASHCOMPLETION, SYSTEMDUNITDIR
+          docker run --rm \
+            -v "${{ github.workspace }}/dist:/out" \
+            -v "${{ github.workspace }}/stage:/stage" \
+            -e TOOLS_TAG \
+            "${TOOLS_IMAGE}" \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq build-essential git ca-certificates bash >/dev/null
+              git clone --depth 1 --branch "$TOOLS_TAG" https://github.com/amnezia-vpn/amneziawg-tools.git /src
+              cd /src
+              COMMIT="$(git rev-parse HEAD)"
+              echo "$COMMIT" > /out/amneziawg-tools.commit
+              echo "$TOOLS_TAG" > /out/amneziawg-tools.tag
+              # Fetch enough history for WIREGUARD_TOOLS_VERSION if git describe works;
+              # shallow clone may leave it empty — that is fine (version.h still exists).
+              make -C src clean
+              make -C src \
+                PREFIX=/usr \
+                WITH_WGQUICK=yes \
+                WITH_SYSTEMDUNITS=no \
+                WITH_BASHCOMPLETION=no
+              make -C src install \
+                DESTDIR=/stage \
+                PREFIX=/usr \
+                WITH_WGQUICK=yes \
+                WITH_SYSTEMDUNITS=no \
+                WITH_BASHCOMPLETION=no
+              test -x /stage/usr/bin/awg
+              test -x /stage/usr/bin/awg-quick
+              install -m 0755 /stage/usr/bin/awg /out/awg-linux-amd64
+              install -m 0755 /stage/usr/bin/awg-quick /out/awg-quick
+              # Record libc target for release notes
+              ldd --version 2>&1 | head -1 | tee /out/glibc-target.txt || true
+            '
+
+      - name: Smoke tests
+        if: steps.existing.outputs.exists != 'true' || steps.existing.outputs.force == 'true'
+        run: |
+          set -euo pipefail
+          cd dist
+
+          fail() { echo "::error::$*"; exit 1; }
+
+          # --- amneziawg-go-linux-amd64 ---
+          test -f amneziawg-go-linux-amd64 || fail "amneziawg-go-linux-amd64 missing"
+          test -s amneziawg-go-linux-amd64 || fail "amneziawg-go-linux-amd64 is empty"
+          file_go="$(file -b amneziawg-go-linux-amd64)"
+          echo "file amneziawg-go-linux-amd64: ${file_go}"
+          echo "$file_go" | grep -qiE 'ELF 64-bit LSB (executable|pie executable), x86-64' \
+            || fail "amneziawg-go-linux-amd64 is not an ELF x86-64 executable: ${file_go}"
+          # `file` reports plain static as "statically linked" but a static-PIE
+          # build as "static-pie linked". -fno-PIC should produce the former;
+          # accept both so a link-mode change fails on substance, not wording.
+          echo "$file_go" | grep -qiE 'statically linked|static-pie linked' \
+            || fail "amneziawg-go-linux-amd64 is not statically linked: ${file_go}"
+          # Verified: main.go accepts --version
+          ./amneziawg-go-linux-amd64 --version
+
+          # --- awg-linux-amd64 ---
+          test -f awg-linux-amd64 || fail "awg-linux-amd64 missing"
+          test -s awg-linux-amd64 || fail "awg-linux-amd64 is empty"
+          file_awg="$(file -b awg-linux-amd64)"
+          echo "file awg-linux-amd64: ${file_awg}"
+          echo "$file_awg" | grep -qiE 'ELF 64-bit LSB (executable|pie executable), x86-64' \
+            || fail "awg-linux-amd64 is not an ELF x86-64 executable: ${file_awg}"
+          # Run inside the same glibc target container (ubuntu:22.04).
+          # Verified: wg.c accepts --version / -v / version
+          docker run --rm \
+            -v "${{ github.workspace }}/dist/awg-linux-amd64:/usr/local/bin/awg:ro" \
+            "${TOOLS_IMAGE}" \
+            bash -euo pipefail -c '
+              /usr/local/bin/awg --version
+              /usr/local/bin/awg help >/dev/null
+            '
+
+          # --- awg-quick ---
+          test -f awg-quick || fail "awg-quick missing"
+          test -s awg-quick || fail "awg-quick is empty"
+          bash -n awg-quick || fail "awg-quick failed bash -n syntax check"
+
+          # --- SHA256SUMS ---
+          sha256sum amneziawg-go-linux-amd64 awg-linux-amd64 awg-quick > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+          {
+            echo "## Smoke tests"
+            echo ""
+            echo "- amneziawg-go-linux-amd64: ELF x86-64, statically linked"
+            echo "- awg-linux-amd64: ELF x86-64, runs in ${TOOLS_IMAGE}"
+            echo "- awg-quick: bash -n OK"
+            echo "- SHA256SUMS: verified"
+            echo ""
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Proves the two binaries actually interoperate over UAPI, which the
+      # per-binary smoke tests above cannot show. This is what catches a
+      # mismatched pair (e.g. a 3.x datapath driven by 2.x tools): `awg setconf`
+      # would send obfuscation keys that amneziawg-go silently ignores, and the
+      # showconf/show round-trip below would not return them.
+      - name: Integration test (awg <-> amneziawg-go over UAPI)
+        if: steps.existing.outputs.exists != 'true' || steps.existing.outputs.force == 'true'
+        run: |
+          set -euo pipefail
+          # amneziawg-go creates a TUN device, so the runner must expose one.
+          sudo modprobe tun || true
+          if [[ ! -c /dev/net/tun ]]; then
+            echo "::error::/dev/net/tun is unavailable on this runner - the UAPI integration test cannot run. Do not disable this test to go green; fix the runner or move the test to a VM."
+            exit 1
+          fi
+          docker run --rm \
+            --cap-add NET_ADMIN \
+            --device /dev/net/tun \
+            -v "${{ github.workspace }}/dist:/dist:ro" \
+            "${TOOLS_IMAGE}" \
+            bash -euo pipefail -c '
+              install -m 0755 /dist/amneziawg-go-linux-amd64 /usr/local/bin/amneziawg-go
+              install -m 0755 /dist/awg-linux-amd64 /usr/local/bin/awg
+
+              # Start the userspace datapath in the foreground and wait for the
+              # UAPI socket. The kernel module never creates this socket, so its
+              # presence also proves which datapath is serving the interface.
+              amneziawg-go -f awg0 &
+              go_pid=$!
+              for _ in $(seq 1 50); do
+                [[ -S /var/run/amneziawg/awg0.sock ]] && break
+                sleep 0.2
+              done
+              if [[ ! -S /var/run/amneziawg/awg0.sock ]]; then
+                echo "amneziawg-go did not create /var/run/amneziawg/awg0.sock"
+                exit 1
+              fi
+
+              priv=$(awg genkey)
+              peer_priv=$(awg genkey)
+              peer_pub=$(printf %s "$peer_priv" | awg pubkey)
+
+              # setconf-valid keys only: Address/MTU/DNS belong to awg-quick.
+              # S1+56 != S2 so the init and response packet sizes cannot collide;
+              # H1-H4 must be distinct and above the 1-4 reserved message types.
+              # Built with printf rather than a heredoc: a heredoc terminator
+              # cannot be indented, and every line here lives inside a YAML
+              # block scalar that requires indentation.
+              printf "%s\n" \
+                "[Interface]" \
+                "PrivateKey = $priv" \
+                "ListenPort = 51820" \
+                "Jc = 4" \
+                "Jmin = 40" \
+                "Jmax = 70" \
+                "S1 = 30" \
+                "S2 = 40" \
+                "S3 = 20" \
+                "S4 = 10" \
+                "H1 = 1000000001" \
+                "H2 = 1000000002" \
+                "H3 = 1000000003" \
+                "H4 = 1000000004" \
+                "" \
+                "[Peer]" \
+                "PublicKey = $peer_pub" \
+                "AllowedIPs = 10.9.9.2/32" \
+                > /tmp/awg0.conf
+
+              awg setconf awg0 /tmp/awg0.conf
+              awg show awg0
+
+              # Read the obfuscation parameters back. If amneziawg-go had not
+              # accepted them over UAPI these would be 0 or absent.
+              [[ "$(awg show awg0 listen-port)" == "51820" ]]
+              [[ "$(awg show awg0 jc)" == "4" ]]
+              [[ "$(awg show awg0 jmin)" == "40" ]]
+              [[ "$(awg show awg0 jmax)" == "70" ]]
+              [[ "$(awg show awg0 s1)" == "30" ]]
+              [[ "$(awg show awg0 s2)" == "40" ]]
+              [[ "$(awg show awg0 s3)" == "20" ]]
+              [[ "$(awg show awg0 s4)" == "10" ]]
+              awg show awg0 peers | grep -qx "$peer_pub"
+
+              awg showconf awg0 > /tmp/roundtrip.conf
+              cat /tmp/roundtrip.conf
+              grep -qx "Jc = 4" /tmp/roundtrip.conf
+              grep -qx "S1 = 30" /tmp/roundtrip.conf
+              grep -qx "S4 = 10" /tmp/roundtrip.conf
+              # H1-H4 are formatted by u32_range_to_string, so only assert that
+              # the tools emit them rather than guessing the exact rendering.
+              grep -q "^H1 = ." /tmp/roundtrip.conf
+              grep -q "^H4 = ." /tmp/roundtrip.conf
+
+              kill "$go_pid"
+              echo "UAPI integration test OK"
+            '
+
+          {
+            echo "## Integration test"
+            echo ""
+            echo "- \`amneziawg-go\` created \`/var/run/amneziawg/awg0.sock\` (userspace datapath confirmed)"
+            echo "- \`awg setconf\` applied Jc/Jmin/Jmax/S1-S4/H1-H4 and \`awg show\`/\`showconf\` read them back unchanged"
+            echo "- peer public key present in \`awg show awg0 peers\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete existing release when force=true
+        if: steps.existing.outputs.exists == 'true' && steps.existing.outputs.force == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.versions.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          echo "Deleting existing release ${RELEASE_TAG} (force=true)..."
+          gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+
+      - name: Publish GitHub Release
+        if: steps.existing.outputs.exists != 'true' || steps.existing.outputs.force == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.versions.outputs.release_tag }}
+          GO_TAG: ${{ steps.versions.outputs.go_tag }}
+          TOOLS_TAG: ${{ steps.versions.outputs.tools_tag }}
+        run: |
+          set -euo pipefail
+          go_commit="$(tr -d '\r' < dist/amneziawg-go.commit)"
+          tools_commit="$(tr -d '\r' < dist/amneziawg-tools.commit)"
+          go_tc="$(tr -d '\r' < dist/go-version.txt)"
+          if [[ -f dist/glibc-target.txt ]]; then
+            glibc_line="$(tr -d '\r' < dist/glibc-target.txt)"
+          else
+            glibc_line="ubuntu:22.04 (glibc 2.35 target)"
+          fi
+
+          go_sha="$(awk '/amneziawg-go-linux-amd64$/ {print $1}' dist/SHA256SUMS)"
+          awg_sha="$(awk '/awg-linux-amd64$/ {print $1}' dist/SHA256SUMS)"
+          quick_sha="$(awk '/awg-quick$/ {print $1}' dist/SHA256SUMS)"
+
+          body_file="$(mktemp)"
+          {
+            echo "## AmneziaWG userspace binaries"
+            echo ""
+            echo "Pre-built **linux/amd64** userspace binaries for Ansible consumption."
+            echo "Upstream publishes no \`amneziawg-go\` release assets; this release fills that gap."
+            echo ""
+            echo "| Component | Upstream tag | Resolved commit |"
+            echo "|---|---|---|"
+            echo "| [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) | \`${GO_TAG}\` | \`${go_commit}\` |"
+            echo "| [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) | \`${TOOLS_TAG}\` | \`${tools_commit}\` |"
+            echo ""
+            echo "**Go toolchain:** \`${go_tc}\` (pinned \`${GO_VERSION}\`)"
+            echo "**amneziawg-go link:** fully static (\`-linkmode external -extldflags \"-fno-PIC -static\"\`, same as upstream Dockerfile)"
+            echo "**awg libc target:** \`${glibc_line}\` — built in \`${TOOLS_IMAGE}\` (glibc 2.35). Runs on Ubuntu 24.04 (glibc 2.39)."
+            echo ""
+            echo "### Assets / SHA256"
+            echo ""
+            echo "| Asset | SHA256 |"
+            echo "|---|---|"
+            echo "| \`amneziawg-go-linux-amd64\` | \`${go_sha}\` |"
+            echo "| \`awg-linux-amd64\` | \`${awg_sha}\` |"
+            echo "| \`awg-quick\` | \`${quick_sha}\` |"
+            echo ""
+            echo "Also attached: \`SHA256SUMS\`."
+            echo ""
+            echo "**Matched pair:** do not mix a 3.x datapath with 2.x tools (or the reverse). Bump both sides of \`version.txt\` together."
+          } > "$body_file"
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TAG" \
+            --notes-file "$body_file" \
+            dist/amneziawg-go-linux-amd64 \
+            dist/awg-linux-amd64 \
+            dist/awg-quick \
+            dist/SHA256SUMS
+
+          {
+            echo "## Published"
+            echo ""
+            echo "Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+            echo ""
+            echo "Asset base URL:"
+            echo "\`https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/\`"
+          } >> "$GITHUB_STEP_SUMMARY"

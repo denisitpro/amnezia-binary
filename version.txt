@@ -1,0 +1,2 @@
+amneziawg-go=v3.0.2
+amneziawg-tools=v3.0.20260730
