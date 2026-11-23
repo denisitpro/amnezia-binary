@@ -29,8 +29,8 @@ as release assets with **stable, predictable names**.
 Two lines, one pinned upstream git tag each:
 
 ```
-amneziawg-go=v3.0.2
-amneziawg-tools=v3.0.20260730
+amneziawg-go=v3.1.20261116
+amneziawg-tools=v3.1.20260812
 ```
 
 - Keys must be exactly `amneziawg-go` and `amneziawg-tools`.
@@ -70,15 +70,15 @@ Release tag pattern:
 awg-<amneziawg-go-tag>-tools-<amneziawg-tools-tag>
 ```
 
-Example for the pins above: `awg-v3.0.2-tools-v3.0.20260730`.
+Example for the pins above: `awg-v3.1.20261116-tools-v3.1.20260812`.
 
 Asset URLs (replace owner/repo if forked):
 
 ```text
-https://github.com/denisitpro/amnezia-binary/releases/download/awg-v3.0.2-tools-v3.0.20260730/amneziawg-go-linux-amd64
-https://github.com/denisitpro/amnezia-binary/releases/download/awg-v3.0.2-tools-v3.0.20260730/awg-linux-amd64
-https://github.com/denisitpro/amnezia-binary/releases/download/awg-v3.0.2-tools-v3.0.20260730/awg-quick
-https://github.com/denisitpro/amnezia-binary/releases/download/awg-v3.0.2-tools-v3.0.20260730/SHA256SUMS
+https://github.com/denisitpro/amnezia-binary/releases/download/awg-v3.1.20261116-tools-v3.1.20260812/amneziawg-go-linux-amd64
+https://github.com/denisitpro/amnezia-binary/releases/download/awg-v3.1.20261116-tools-v3.1.20260812/awg-linux-amd64
+https://github.com/denisitpro/amnezia-binary/releases/download/awg-v3.1.20261116-tools-v3.1.20260812/awg-quick
+https://github.com/denisitpro/amnezia-binary/releases/download/awg-v3.1.20261116-tools-v3.1.20260812/SHA256SUMS
 ```
 
 ### Build notes
@@ -98,7 +98,7 @@ https://github.com/denisitpro/amnezia-binary/releases/download/awg-v3.0.2-tools-
 ```yaml
 - name: Ensure AmneziaWG userspace binaries are installed
   vars:
-    awg_release: "awg-v3.0.2-tools-v3.0.20260730"
+    awg_release: "awg-v3.1.20261116-tools-v3.1.20260812"
     awg_base_url: "https://github.com/denisitpro/amnezia-binary/releases/download/{{ awg_release }}"
     # Fill these from SHA256SUMS of that release (do not invent checksums).
     amneziawg_go_sha256: "REPLACE_WITH_SHA256_FROM_SHA256SUMS"
